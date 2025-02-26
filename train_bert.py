@@ -1,90 +1,66 @@
-import pandas as pd
-import torch
-from torch.utils.data import TensorDataset, DataLoader
-from transformers import BertTokenizerFast, BertConfig, BertForMaskedLM, AdamW
-from tqdm import tqdm
+from transformers import BertTokenizer
+from transformers import BertConfig, BertForPreTraining
+from transformers import TextDatasetForNextSentencePrediction
+from transformers import DataCollatorForLanguageModeling
+from transformers import Trainer, TrainingArguments
 
-df = pd.read_csv("filtered_formulas.csv", encoding="cp1251")
 
-df['combined_text'] = df.apply(
-    lambda row: f"{row['left_context']} [FORMULA] {row['formula']} [FORMULA] {row['right_context']}", axis=1)
+TOKENIZER_PATH = ""
+DATASET_PATH = ""
 
-tokenizer = BertTokenizerFast.from_pretrained("bert-base-uncased")
-special_tokens = {"additional_special_tokens": ["[FORMULA]"]}
-tokenizer.add_special_tokens(special_tokens)
-
-batch_size = 128
-all_input_ids = []
-all_attention_masks = []
-
-for i in tqdm(range(0, len(df), batch_size)):
-    batch_texts = df['combined_text'][i:i + batch_size].tolist()
-
-    encoded_batch = tokenizer(batch_texts,
-                              padding=True,
-                              truncation=True,
-                              max_length=512,
-                              return_tensors="pt")
-
-    all_input_ids.append(encoded_batch["input_ids"])
-    all_attention_masks.append(encoded_batch["attention_mask"])
-
-max_length = max([tensor.shape[1] for tensor in all_input_ids])
-
-padded_input_ids = [torch.nn.functional.pad(tensor, (0, max_length - tensor.shape[1]), value=tokenizer.pad_token_id)
-                    for tensor in all_input_ids]
-
-padded_attention_masks = [torch.nn.functional.pad(tensor, (0, max_length - tensor.shape[1]), value=0)
-                          for tensor in all_attention_masks]
-
-input_ids = torch.cat(padded_input_ids)
-attention_masks = torch.cat(padded_attention_masks)
-
-config = BertConfig(
-    vocab_size=tokenizer.vocab_size,
-    hidden_size=768,
-    num_hidden_layers=12,
-    num_attention_heads=12,
-    intermediate_size=3072
+bert_cased_tokenizer = BertTokenizer.from_pretrained(
+    pretrained_model_name_or_path=TOKENIZER_PATH,
+    do_lower_case=False,
+    truncation=True,
+    model_max_length=512
 )
 
-model = BertForMaskedLM(config)
-model.resize_token_embeddings(len(tokenizer))
+config = BertConfig(max_position_embeddings=512)
+model = BertForPreTraining(config)
+model.resize_token_embeddings(len(bert_cased_tokenizer))
 
-optimizer = AdamW(model.parameters(), lr=5e-5)
+dataset = TextDatasetForNextSentencePrediction(
+    tokenizer=bert_cased_tokenizer,
+    file_path=DATASET_PATH,
+    block_size=512
+)
 
-train_dataset = TensorDataset(input_ids, attention_masks)
-train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True)
+for i in range(len(dataset)):
+    example = dataset[i]
 
-device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-model.to(device)
+    if len(example['input_ids']) > 512:
+        example['input_ids'] = example['input_ids'][:512]
 
-model.train()
-epochs = 3
+        if 'attention_mask' in example:
+            example['attention_mask'] = example['attention_mask'][:512]
 
-total_steps = epochs * len(train_loader)
-progress_bar = tqdm(total=total_steps, desc="Training: ")
+        if 'token_type_ids' in example:
+            example['token_type_ids'] = example['token_type_ids'][:512]
 
-for epoch in range(epochs):
-    total_loss = 0
-    for batch in train_loader:
-        input_ids_batch, attention_masks_batch = batch
-        input_ids_batch = input_ids_batch.to(device)
-        attention_masks_batch = attention_masks_batch.to(device)
+data_collator = DataCollatorForLanguageModeling(
+    tokenizer=bert_cased_tokenizer,
+    mlm=True,
+    mlm_probability=0.15,
+    return_tensors="pt",
+    pad_to_multiple_of=512
+)
 
-        outputs = model(input_ids=input_ids_batch, attention_mask=attention_masks_batch, labels=input_ids_batch)
-        loss = outputs.loss
+training_args = TrainingArguments(
+    output_dir="./output/",
+    overwrite_output_dir=True,
+    num_train_epochs=2,
+    per_device_train_batch_size=2,
+    save_steps=10_000,
+    save_total_limit=2,
+    prediction_loss_only=True
+)
 
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    data_collator=data_collator,
+    train_dataset=dataset,
+)
 
-        total_loss += loss.item()
-        progress_bar.update(1)
-
-    print(f"Epoch {epoch + 1}, Loss: {total_loss / len(train_loader)}")
-
-progress_bar.close()
-
-model.save_pretrained("./bert")
-tokenizer.save_pretrained("./bert")
+trainer.train()
+trainer.save_model("./output/model/")
